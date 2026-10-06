@@ -1,0 +1,303 @@
+I reviewed GCS_to_Azure_Migration_Runbook (1) and overall it's much better than the original concept. It is deployable, operationally focused, and includes verification checkpoints.
+
+Overall Assessment
+Area	RatingArchitecture	9/10
+Scalability	8/10
+Operations	9/10
+Rollback Design	9/10
+Security	8/10
+Monitoring	7/10
+HA/Resiliency	6/10
+Production Readiness	8.5/10
+
+Verdict: I would approve for a production PoC and near-production deployment after a few fixes.
+
+What I Like
+1. Event Dedupe Table
+
+You added:
+
+SQL
+CREATE TABLE event_dedupe
+
+This is excellent.
+
+Previously we discussed dedupe using file_events, but a dedicated dedupe table is cleaner and faster.
+
+2. Rollback Not Enabled During Initial Load
+
+You explicitly create Event Grid only after cutover.
+
+This prevents:
+
+Plain Text
+Bulk Migration
+|
+Event Grid floods queue
+|
+Rollback chaos
+
+Excellent design decision.
+
+3. VM Identity Instead of Key Files
+
+Using:
+
+Plain Text
+env_auth=true
+
+and VM service account auth instead of storing GCP keys is best practice.
+
+4. Docker Workers
+
+Moving from systemd worker services to Docker workers is the correct upgrade path.
+
+5. Clear Go/No-Go Validation
+
+The cutover section requires:
+
+Plain Text
+Pending = 0
+Failed = 0
+DLQ Empty
+rclone check clean
+
+before cutover.
+
+That's exactly what CAB reviewers want to see.
+
+Major Improvements Needed
+Issue 1 (Important)
+Batch Size Too Small
+
+Current:
+
+Plain Text
+1000 files
+OR
+500 MB
+OR
+5 minutes
+
+For your environment:
+
+Plain Text
+10 buckets
+Unknown growth
+Potentially millions of files
+ 
+
+I recommend:
+
+Plain Text
+5000 files
+OR
+5 GB
+OR
+2 minutes
+
+Reason:
+
+Plain Text
+1000 files
+=
+Too many batches
+Too much DB overhead
+Issue 2 (Critical)
+
+Worker currently executes bucket-level copy.
+
+I see references such as:
+
+Shell
+rclone copy gcs:$B azure:$B
+
+during migration.
+
+For delta workers, avoid repeatedly scanning entire buckets.
+
+Recommended:
+
+Plain Text
+Batch
+|
+batchfile.txt
+|
+rclone --files-from batchfile.txt
+
+Much more scalable.
+
+Issue 3 (Critical)
+
+No stale batch recovery.
+
+Current:
+
+SQL
+PROCESSING
+
+can remain forever if a worker dies.
+
+Add recovery cron.
+
+Example:
+
+SQL
+UPDATE sync_batches
+SET status='PENDING'
+WHERE status='PROCESSING'
+AND created_at < NOW() - INTERVAL '30 minutes';
+
+Without this, one crashed worker can leave batches stranded.
+
+Issue 4 (Critical)
+
+No PostgreSQL backup section.
+
+I would add.
+
+Daily backup:
+
+Shell
+pg_dump gcssync \
+> /backup/gcssync_$(date +%F).sql
+
+Retention:
+
+Plain Text
+30 Days
+
+The runbook currently lacks PostgreSQL recovery procedures.
+
+Issue 5 (Important)
+
+No WAL/Vacuum maintenance.
+
+With millions of events:
+
+SQL
+file_events
+batch_files
+blob_events
+
+will grow rapidly.
+
+Add:
+
+SQL
+VACUUM ANALYZE;
+
+and archive policy.
+
+Otherwise performance will degrade.
+
+High Availability Gaps
+
+Currently:
+
+Plain Text
+1 VM
+1 PostgreSQL
+1 Listener
+
+This is a SPOF.
+
+For production I recommend:
+
+Plain Text
+Daily VM Snapshot
+ 
+OR
+ 
+Secondary standby VM
+
+At minimum:
+
+Shell
+gcloud compute disks snapshot
+ 
+
+nightly.
+
+Monitoring Improvements
+
+Current monitoring is mostly manual queries.
+
+Add alerts.
+
+Alert 1
+SQL
+PENDING > 100000
+
+Trigger email.
+
+Alert 2
+SQL
+FAILED > 100
+
+Trigger email.
+
+Alert 3
+SQL
+Oldest Pending > 15 min
+
+Trigger email.
+
+Alert 4
+Plain Text
+Listener service down
+
+Trigger email.
+
+Rollback Design Review
+
+Rollback is actually very good.
+
+The document correctly:
+
+Stops forward sync.
+Drains queue.
+Starts rollback workers.
+Uses rclone copy.
+Does not use rclone sync.
+Removes Event Grid subscription afterward.
+
+I would keep this exactly as written.
+
+One Thing I Would Add
+
+Create an operations dashboard query:
+
+SQL
+SELECT
+status,
+COUNT(*)
+FROM file_events
+GROUP BY status;
+`
+
+and
+
+SQL
+SELECT
+COUNT(*)
+FROM sync_batches
+WHERE status='PENDING';
+
+Run every minute and expose via Grafana.
+
+Final Score
+Current Runbook
+
+8.5 / 10
+
+After Fixes
+Increase batch size
+Add stale batch recovery
+Add PostgreSQL backup
+Add VACUUM/retention
+Add alerting
+
+9.5 / 10
+
+For your actual migration project, I would be comfortable taking this version to production after those improvements. The architecture is significantly stronger than the original VM + single listener + per-file copy design and should scale much better for unpredictable growth

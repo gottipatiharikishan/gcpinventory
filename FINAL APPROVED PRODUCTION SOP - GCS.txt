@@ -1,0 +1,1128 @@
+FINAL APPROVED PRODUCTION SOP - GCS TO AZURE MULTI-BUCKET MIGRATION PLATFORM
+
+Final Recommendation
+
+Keep Existing Components:
+
+Existing VM
+Existing PostgreSQL (on VM)
+Existing Pub/Sub
+Existing rclone
+Existing Azure Event Grid
+Existing Azure Queue
+Existing listener.py
+Existing rollback_listener.py
+
+Add:
+
+Pub/Sub Dead Letter Queue (DLQ)
+Batch Processing
+Docker Worker Pool
+Dynamic Worker Scaling
+Retry Framework
+PostgreSQL Partitioning
+Monitoring & Alerts
+Rollback Worker Pool
+
+Do NOT Implement:
+
+Cloud Run
+Cloud SQL
+Azure Functions
+Additional VMs initially
+
+ARCHITECTURE
+
+GCS Buckets → Bucket Notifications → Pub/Sub → listener.py → PostgreSQL → Batch Creator → Docker Worker Pool (10-100 Workers) → rclone → Azure Blob
+
+Rollback Flow:
+
+Azure Blob → Event Grid → Azure Storage Queue → rollback_listener.py → PostgreSQL → Rollback Batch Creator → Docker Rollback Worker Pool (10-100 Workers) → rclone → GCS
+
+Failed Flow:
+
+Pub/Sub → DLQ Topic → DLQ Subscription
+
+VM RECOMMENDATION
+
+Current: 8 vCPU 32 GB RAM 500 GB SSD
+
+Future: 16 vCPU 64 GB RAM 1 TB SSD
+
+PHASE 1 - CONFIGURE DLQ
+
+Create DLQ Topic
+
+gcloud pubsub topics create gcs-dlq
+
+Create DLQ Subscription
+
+gcloud pubsub subscriptions create gcs-dlq-sub --topic=gcs-dlq
+
+Attach DLQ
+
+gcloud pubsub subscriptions update gcs-azureblob-sync --dead-letter-topic=gcs-dlq --max-delivery-attempts=5
+
+Verify
+
+gcloud pubsub subscriptions describe gcs-azureblob-sync
+
+PHASE 2 - POSTGRESQL IMPROVEMENTS
+
+Connect
+
+sudo -u postgres psql -d gcssync
+
+Add Columns
+
+ALTER TABLE file_events ADD COLUMN retry_count INTEGER DEFAULT 0; ALTER TABLE file_events ADD COLUMN worker_name VARCHAR(100); ALTER TABLE file_events ADD COLUMN error_message TEXT;
+
+ALTER TABLE blob_events ADD COLUMN retry_count INTEGER DEFAULT 0; ALTER TABLE blob_events ADD COLUMN worker_name VARCHAR(100); ALTER TABLE blob_events ADD COLUMN error_message TEXT;
+
+Create Indexes
+
+CREATE INDEX idx_file_status ON file_events(status); CREATE INDEX idx_blob_status ON blob_events(status); CREATE INDEX idx_file_created ON file_events(created_at);
+
+PHASE 3 - PARTITIONING
+
+CREATE TABLE file_events ( id BIGSERIAL, bucket_name VARCHAR(255), object_name TEXT, generation VARCHAR(100), status VARCHAR(30), retry_count INTEGER, created_at TIMESTAMP, processed_at TIMESTAMP ) PARTITION BY RANGE(created_at);
+
+CREATE TABLE file_events_2026_10 PARTITION OF file_events FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+
+Create a new partition every month.
+
+PHASE 4 - MODIFY LISTENER
+
+Current:
+
+PubSub → listener.py → rclone → Azure
+
+New:
+
+PubSub → listener.py → PostgreSQL
+
+Deduplication Check
+
+SELECT id FROM file_events WHERE bucket_name='bucket1' AND object_name='sample.csv' AND generation='12345';
+
+Insert New Event
+
+INSERT INTO file_events (bucket_name,object_name,generation,status) VALUES ('bucket1','sample.csv','12345','NEW');
+
+PHASE 5 - BATCH TABLE
+
+CREATE TABLE sync_batches ( batch_id BIGSERIAL PRIMARY KEY, bucket_name VARCHAR(255), file_count INTEGER, status VARCHAR(30), created_at TIMESTAMP DEFAULT NOW() );
+
+Batch Rules:
+
+1000 files per batch
+OR 500 MB
+OR 5 minutes
+Whichever occurs first
+
+PHASE 6 - INSTALL DOCKER
+
+sudo apt update
+
+sudo apt install docker.io docker-compose-plugin -y
+
+sudo systemctl enable docker
+
+sudo systemctl start docker
+
+Verify
+
+docker ps
+
+PHASE 7 - WORKER DOCKERFILE
+
+FROM rclone/rclone:latest
+
+RUN apk add --no-cache python3 py3-pip
+
+RUN pip install psycopg2-binary
+
+WORKDIR /app
+
+COPY worker.py .
+
+CMD ["python3","worker.py"]
+
+Build
+
+docker build -t gcs-worker .
+
+PHASE 8 - WORKER LOGIC
+
+Get Batch
+
+SELECT * FROM sync_batches WHERE status='PENDING' FOR UPDATE SKIP LOCKED LIMIT 1;
+
+Lock Batch
+
+UPDATE sync_batches SET status='PROCESSING' WHERE batch_id=1;
+
+Transfer
+
+rclone copy
+ gcs:bucket1
+ azure:bucket1
+ --transfers=64
+ --checkers=64
+ --fast-list
+ --multi-thread-streams=8
+ --buffer-size=64M
+
+Complete
+
+UPDATE sync_batches SET status='COMPLETED' WHERE batch_id=1;
+
+Failure
+
+UPDATE sync_batches SET status='FAILED' WHERE batch_id=1;
+
+PHASE 9 - DOCKER COMPOSE
+
+services: worker: image: gcs-worker restart: unless-stopped
+
+PHASE 10 - DYNAMIC SCALING
+
+Backlog < 100 Batches
+
+docker compose up -d --scale worker=10
+
+Backlog 100-1000 Batches
+
+docker compose up -d --scale worker=25
+
+Backlog 1000-5000 Batches
+
+docker compose up -d --scale worker=50
+
+Backlog > 5000 Batches
+
+docker compose up -d --scale worker=100
+
+PHASE 11 - AUTOSCALE SCRIPT
+
+Location
+
+/opt/gcs-azure-sync/autoscale.sh
+
+Logic
+
+0-100 batches = 10 workers 100-1000 batches = 25 workers 1000-5000 batches = 50 workers 5000+ batches = 100 workers
+
+Cron
+
+crontab -e
+
+Add
+
+*/5 * * * * /opt/gcs-azure-sync/autoscale.sh
+
+PHASE 12 - RETRY FRAMEWORK
+
+Increment Retry
+
+UPDATE file_events SET retry_count=retry_count+1 WHERE id=101;
+
+Max Retry = 5
+
+UPDATE file_events SET status='FAILED' WHERE retry_count >= 5;
+
+PHASE 13 - ROLLBACK DESIGN
+
+Azure Blob → Event Grid → Storage Queue → rollback_listener.py → PostgreSQL → rollback_batches → Rollback Worker Pool → rclone → GCS
+
+Rollback Batch Table
+
+CREATE TABLE rollback_batches ( batch_id BIGSERIAL PRIMARY KEY, container_name VARCHAR(255), file_count INTEGER, status VARCHAR(30), created_at TIMESTAMP DEFAULT NOW() );
+
+Rollback Worker Scale
+
+Normal = 10 Medium = 25 High = 50 Emergency = 100
+
+PHASE 14 - MONITORING
+
+Pending Files
+
+SELECT COUNT(*) FROM file_events WHERE status='NEW';
+
+Pending Batches
+
+SELECT COUNT(*) FROM sync_batches WHERE status='PENDING';
+
+Failed Files
+
+SELECT COUNT(*) FROM file_events WHERE status='FAILED';
+
+Failed Batches
+
+SELECT COUNT(*) FROM sync_batches WHERE status='FAILED';
+
+Worker Utilization
+
+SELECT worker_name,COUNT(*) FROM file_events GROUP BY worker_name;
+
+Oldest Backlog
+
+SELECT MIN(created_at), NOW()-MIN(created_at) FROM file_events WHERE status='NEW';
+
+PHASE 15 - HEALTH CHECKS
+
+Listener
+
+systemctl status gcs-rclone-sync
+
+Rollback Listener
+
+systemctl status azure-gcs-rollback
+
+PostgreSQL
+
+systemctl status postgresql
+
+Workers
+
+docker ps
+
+Listener Logs
+
+journalctl -u gcs-rclone-sync -f
+
+Rollback Logs
+
+journalctl -u azure-gcs-rollback -f
+
+Worker Logs
+
+docker logs
+
+PHASE 16 - DAILY OPERATIONS
+
+Check Listener
+
+systemctl status gcs-rclone-sync
+
+Check PostgreSQL
+
+systemctl status postgresql
+
+Check Docker
+
+docker ps
+
+Check Pending Files
+
+SELECT COUNT(*) FROM file_events WHERE status='NEW';
+
+Check Failed Files
+
+SELECT COUNT(*) FROM file_events WHERE status='FAILED';
+
+Check DLQ
+
+gcloud pubsub subscriptions pull gcs-dlq-sub --limit=20
+
+Review Failed Records
+
+SELECT * FROM file_events WHERE status='FAILED' ORDER BY created_at DESC LIMIT 100;
+
+PHASE 17 - CUTOVER
+
+Verify Pending Batches
+
+SELECT COUNT(*) FROM sync_batches WHERE status='PENDING';
+
+Expected Result = 0
+
+Verify Failed Batches
+
+SELECT COUNT(*) FROM sync_batches WHERE status='FAILED';
+
+Expected Result = 0
+
+Final Sync
+
+rclone sync
+ gcs:bucket1
+ azure:bucket1
+ --transfers=64
+ --checkers=64
+
+Repeat for all buckets.
+
+Validation
+
+rclone check
+ gcs:bucket1
+ azure:bucket1
+
+Switch Applications
+
+Before: Application → GCS
+
+After: Application → Azure Blob
+
+FINAL PRODUCTION DESIGN
+
+VM + PostgreSQL + Pub/Sub + DLQ + Docker
+
+GCS → Bucket Notifications → Pub/Sub → listener.py → PostgreSQL → Batch Creator → 10-100 Docker Workers → rclone → Azure Blob
+
+Rollback:
+
+Azure Blob → Event Grid → Azure Storage Queue → rollback_listener.py → PostgreSQL → Rollback Batch Creator → 10-100 Rollback Workers → rclone → GCS
+
+Benefits:
+
+Supports unpredictable growth (1 TB/day to 10+ TB/day)
+Handles millions of files using batching
+Dynamic scaling (10-100 workers)
+Low cost
+Reuses existing implementation
+Full rollback support
+Enterprise scale without Cloud Run or Cloud SQL migration.
+
+
+
+COMPLETE SOP - GCS → AZURE MULTI-BUCKET MIGRATION PLATFORM
+Production Architecture v4.0 (VM + PostgreSQL + Docker Workers)
+1. PURPOSE
+
+This SOP provides a complete implementation for:
+
+Initial data migration
+Delta synchronization
+Auto-scaled worker processing
+Rollback support
+Failure handling
+Monitoring
+High-volume processing
+Multi-bucket support
+
+Target Capacity:
+
+Plain Text
+1 TB/day → 10+ TB/day
+Millions of files
+Small to large file support
+10+ Buckets
+2. ARCHITECTURE
+Plain Text
+GCS Bucket
+|
+Bucket Notification
+|
+Pub/Sub
+|
+listener.py
+|
+PostgreSQL
+|
+batch_creator.py
+|
+sync_batches
+|
+Docker Worker Pool
+(10-100 Workers)
+|
+rclone
+|
+Azure Blob
+ 
+===========================
+ 
+ROLLBACK
+ 
+Azure Blob
+|
+Event Grid
+|
+Azure Queue
+|
+rollback_listener.py
+|
+PostgreSQL
+|
+rollback_batches
+|
+Docker Rollback Workers
+|
+rclone
+|
+GCS
+ 
+===========================
+ 
+FAILURES
+ 
+Pub/Sub
+|
+DLQ Topic
+|
+DLQ Subscription
+``
+3. DIRECTORY STRUCTURE
+Plain Text
+/opt/gcs-azure-sync
+ 
+├── listener.py
+├── worker.py
+├── batch_creator.py
+├── rollback_listener.py
+├── rollback_worker.py
+├── autoscale.sh
+├── docker-compose.yml
+├── Dockerfile
+├── .env
+└── logs/
+4. POSTGRESQL SETUP
+
+Connect:
+
+Shell
+sudo -u postgres psql
+
+Create DB:
+
+SQL
+CREATE DATABASE gcssync;
+
+Create User:
+
+SQL
+CREATE USER gcssync
+WITH PASSWORD 'StrongPassword';
+ 
+GRANT ALL PRIVILEGES
+ON DATABASE gcssync
+TO gcssync;
+5. EVENT TABLES
+SQL
+CREATE TABLE file_events
+(
+id BIGSERIAL PRIMARY KEY,
+ 
+bucket_name VARCHAR(255),
+ 
+object_name TEXT,
+ 
+generation VARCHAR(100),
+ 
+status VARCHAR(20) DEFAULT 'NEW',
+ 
+retry_count INTEGER DEFAULT 0,
+ 
+worker_name VARCHAR(100),
+ 
+error_message TEXT,
+ 
+created_at TIMESTAMP DEFAULT NOW(),
+ 
+processed_at TIMESTAMP
+);
+6. BATCH TABLE
+SQL
+CREATE TABLE sync_batches
+(
+batch_id BIGSERIAL PRIMARY KEY,
+ 
+bucket_name VARCHAR(255),
+ 
+file_count INTEGER,
+ 
+status VARCHAR(20),
+ 
+created_at TIMESTAMP DEFAULT NOW(),
+ 
+completed_at TIMESTAMP
+);
+ 
+7. BATCH FILE MAPPING
+SQL
+CREATE TABLE batch_files
+(
+batch_id BIGINT,
+ 
+file_event_id BIGINT
+);
+8. ROLLBACK TABLES
+SQL
+CREATE TABLE blob_events
+(
+id BIGSERIAL PRIMARY KEY,
+ 
+container_name VARCHAR(255),
+ 
+blob_name TEXT,
+ 
+status VARCHAR(20) DEFAULT 'NEW',
+ 
+retry_count INTEGER DEFAULT 0,
+ 
+worker_name VARCHAR(100),
+ 
+error_message TEXT,
+ 
+created_at TIMESTAMP DEFAULT NOW(),
+ 
+processed_at TIMESTAMP
+);
+SQL
+CREATE TABLE rollback_batches
+(
+batch_id BIGSERIAL PRIMARY KEY,
+ 
+container_name VARCHAR(255),
+ 
+file_count INTEGER,
+ 
+status VARCHAR(20),
+ 
+created_at TIMESTAMP DEFAULT NOW(),
+ 
+completed_at TIMESTAMP
+);
+9. INDEXES
+SQL
+CREATE INDEX idx_file_status
+ON file_events(status);
+ 
+CREATE INDEX idx_blob_status
+ON blob_events(status);
+ 
+CREATE INDEX idx_created
+ON file_events(created_at);
+10. DLQ CONFIGURATION
+
+Create Topic:
+
+Shell
+gcloud pubsub topics create gcs-dlq
+
+Create Subscription:
+
+Shell
+gcloud pubsub subscriptions create \
+gcs-dlq-sub \
+--topic=gcs-dlq
+
+Attach DLQ:
+
+Shell
+gcloud pubsub subscriptions update \
+gcs-azureblob-sync \
+--dead-letter-topic=gcs-dlq \
+--max-delivery-attempts=5
+
+Verify:
+
+Shell
+gcloud pubsub subscriptions describe \
+gcs-azureblob-sync
+11. LISTENER LOGIC
+
+Purpose:
+
+Plain Text
+Receive Pub/Sub Event
+Check Duplicate
+Insert PostgreSQL Record
+
+Pseudo Code
+
+Python
+while True:
+ 
+msg = read_pubsub()
+ 
+if exists(msg):
+continue
+ 
+insert_file_event(
+bucket,
+file_name,
+generation
+)
+12. DUPLICATE CHECK
+SQL
+SELECT id
+FROM file_events
+WHERE bucket_name=$1
+AND object_name=$2
+AND generation=$3;
+13. INSERT EVENT
+SQL
+INSERT INTO file_events
+(
+bucket_name,
+object_name,
+generation,
+status
+)
+VALUES
+(
+$1,
+$2,
+$3,
+'NEW'
+);
+14. BATCH CREATOR
+
+Runs every minute.
+
+Fetch NEW files:
+
+SQL
+SELECT *
+FROM file_events
+WHERE status='NEW'
+LIMIT 5000;
+
+Create Batch:
+
+SQL
+INSERT INTO sync_batches
+(
+bucket_name,
+file_count,
+status
+)
+VALUES
+(
+'bucket1',
+5000,
+'PENDING'
+);
+
+Update Events:
+
+SQL
+UPDATE file_events
+SET status='BATCHED'
+WHERE id IN (...);
+15. BATCH RULES
+
+Batch is created when:
+
+Plain Text
+5000 Files Reached
+ 
+OR
+ 
+5 GB Data
+ 
+OR
+ 
+2 Minutes Passed
+``
+
+Whichever occurs first.
+
+16. INSTALL DOCKER
+Shell
+sudo apt update
+ 
+sudo apt install docker.io -y
+ 
+sudo systemctl enable docker
+ 
+sudo systemctl start docker
+``
+
+Verify:
+
+Shell
+docker ps
+17. DOCKERFILE
+Dockerfile
+FROM rclone/rclone:latest
+ 
+RUN apk add --no-cache python3 py3-pip
+ 
+RUN pip install psycopg2-binary
+ 
+WORKDIR /app
+ 
+COPY worker.py .
+ 
+CMD ["python3","worker.py"]
+
+Build:
+
+Shell
+docker build -t gcs-worker .
+18. DOCKER COMPOSE
+YAML
+services:
+ 
+worker:
+image: gcs-worker
+restart: unless-stopped
+ 
+rollback-worker:
+image: gcs-worker
+restart: unless-stopped
+19. WORKER LOGIC
+
+Fetch next batch.
+
+SQL
+SELECT *
+FROM sync_batches
+WHERE status='PENDING'
+FOR UPDATE SKIP LOCKED
+LIMIT 1;
+
+Lock:
+
+SQL
+UPDATE sync_batches
+SET status='PROCESSING'
+WHERE batch_id=1;
+
+Fetch files.
+
+Transfer.
+
+Mark complete.
+
+SQL
+UPDATE sync_batches
+SET
+status='COMPLETED',
+completed_at=NOW()
+WHERE batch_id=1;
+20. FILE COPY COMMAND
+
+Recommended:
+
+Shell
+rclone copy \
+gcs:bucket1 \
+azure:bucket1 \
+--transfers=64 \
+--checkers=64 \
+--fast-list \
+--multi-thread-streams=8 \
+--buffer-size=64M \
+--log-level INFO
+21. RETRY LOGIC
+
+Failure:
+
+SQL
+UPDATE file_events
+SET retry_count=retry_count+1
+WHERE id=100;
+
+Mark Failed:
+
+SQL
+UPDATE file_events
+SET status='FAILED'
+WHERE retry_count >=5;
+22. AUTOSCALING SCRIPT
+
+Create:
+
+Shell
+nano autoscale.sh
+Shell
+#!/bin/bash
+ 
+PENDING=$(psql -d gcssync -t -c "
+SELECT COUNT(*)
+FROM sync_batches
+WHERE status='PENDING';
+")
+ 
+if [ $PENDING -lt 100 ]
+then
+docker compose up -d --scale worker=10
+ 
+elif [ $PENDING -lt 1000 ]
+then
+docker compose up -d --scale worker=25
+ 
+elif [ $PENDING -lt 5000 ]
+then
+docker compose up -d --scale worker=50
+ 
+else
+docker compose up -d --scale worker=100
+ 
+fi
+
+Permission:
+
+Shell
+chmod +x autoscale.sh
+``
+23. CRON
+Shell
+crontab -e
+
+Add:
+
+Shell
+*/5 * * * * /opt/gcs-azure-sync/autoscale.sh
+24. ROLLBACK LISTENER
+
+Flow:
+
+Plain Text
+Azure Queue Message
+ 
+↓
+ 
+blob_events
+ 
+↓
+ 
+rollback_batches
+
+Insert:
+
+SQL
+INSERT INTO blob_events
+(
+container_name,
+blob_name,
+status
+)
+VALUES
+(
+$1,
+$2,
+'NEW'
+);
+25. ROLLBACK WORKER
+
+Fetch:
+
+SQL
+SELECT *
+FROM rollback_batches
+WHERE status='PENDING'
+FOR UPDATE SKIP LOCKED
+LIMIT 1;
+
+Execute:
+
+Shell
+rclone copy \
+azure:container \
+gcs:bucket \
+--transfers=64 \
+--checkers=64
+
+Mark Complete:
+
+SQL
+UPDATE rollback_batches
+SET status='COMPLETED'
+WHERE batch_id=1;
+26. MONITORING QUERIES
+
+Pending:
+
+SQL
+SELECT COUNT(*)
+FROM file_events
+WHERE status='NEW';
+
+Batched:
+
+SQL
+SELECT COUNT(*)
+FROM file_events
+WHERE status='B*TCHED';
+
+Processing:
+
+SQL
+S*LECT COUNT(*)
+FROM sync_batches
+WH*RE status='PROCESSING';
+
+Failed:
+
+SQL
+SELECT COUNT(*)
+FROM fil*_events
+WHERE status='FAILED';
+```*
+
+Completed:
+
+SQL
+SELECT COUNT(**
+FROM sync_batches
+WHERE status='C*MPLETED';
+27. HEALTH CHECKS
+
+Listener:
+
+Shell
+systemctl*status gcs-rclone-sync
+
+Rollback Listener:
+
+Shell
+systemctl status azure-gcs-rollbac*
+
+PostgreSQL:
+
+Shell
+systemc*l status postgresql
+
+Docker Workers:
+
+Shell
+*ocker ps
+28. LOG CHECKS
+
+Listener:
+
+Shell
+journalctl -u gcs-r*lone-sync -f
+
+Rollback:
+
+Shell
+*ournalctl -u azure-gcs-rollback -f*
+
+Workers:
+
+Shell
+*ocker logs <container-id>
+29. DAILY CHECKS
+Shell
+systemctl status gcs-rclone*sync
+ 
+systemctl*status postgresql
+ 
+docker ps
+
+Check Failures:
+
+SQL
+SELECT *
+FROM file_events
+WHERE*status*'FAILED'
+ORDER BY created_at DESC
+*IMIT 100;
+
+Check DLQ:
+
+Shell
+gcloud pubsub subscriptions pull \*gcs-dlq-sub \
+--limit=20
+30. PRE-CUTOVER VALIDATION
+
+Pending Batches:
+
+SQL
+SELECT COUNT(**
+FROM sync_batches
+WHERE status='P*NDING';
+
+Expected:
+
+Plain Text
+0
+
+Failed Batches:
+
+SQL
+SELECT COUNT(*)
+FROM sync_batches
+WHERE status='FAILED';
+
+Expected:
+
+Plain Text
+0
+31. FINAL VALIDATION
+Shell
+rclone check \
+gcs:bucket1 \
+azure:bucket1
+
+Repeat for all buckets.
+
+32. CUTOVER
+
+Before:
+
+Plain Text
+Applications → GCS
+
+After:
+
+Plain Text
+Applications → Azure Blob
+
+Monitor:
+
+Plain Text
+24-48 Hours
+FINAL PRODUCTION DESIGN
+Plain Text
+GCS
+|
+Bucket Notifications
+|
+Pub/Sub
+|
+listener.py
+|
+PostgreSQL
+|
+Batch Creator
+|
+10-100 Docker Workers
+|
+rclone
+|
+Azure Blob
+ 
+-------------------------
+ 
+Azure Blob
+|
+Event Grid
+|
+Azure Queue
+|
+rollback_listener.py
+|
+PostgreSQL
+|
+Rollback Batch Creator
+|
+10-100 Rollback Workers
+|
+rclone
+|
+GCS
+ 
+-------------------------
+ 
+DLQ
+|
+Failed Pub/Sub Messages
+Production Characteristics
+Supports 1 TB/day to 10+ TB/day
+Supports millions of files
+Handles very small files efficiently using batching
+Dynamic worker scaling (10 → 25 → 50 → 100)
+Full rollback support
+No Cloud Run cost
+No Cloud SQL cost
+Reuses existing VM, PostgreSQL, Pub/Sub, rclone, Event Grid and Queue architecture
+Suitable for production testing from scratch and future scale-out.
+Provide your feedback on BizChat

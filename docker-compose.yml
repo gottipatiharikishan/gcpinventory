@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+
+  worker:
+    image: gcs-worker:1.0
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      - /home/trianzadmin/.config/rclone:/root/.config/rclone
+      - /opt/gcs-azure-sync/rclone-sa-key.json:/opt/gcs-azure-sync/rclone-sa-key.json:ro
+    command: python3 worker.py
+
+  rollback-worker:
+    image: gcs-worker:1.0
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      - /home/trianzadmin/.config/rclone:/root/.config/rclone
+      - /opt/gcs-azure-sync/rclone-sa-key.json:/opt/gcs-azure-sync/rclone-sa-key.json:ro
+    command: python3 rollback_worker.py

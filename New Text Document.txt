@@ -1,0 +1,286 @@
+Perfect. This actually confirms your system is now behaving correctly.
+
+Timeline
+
+Initially:
+
+Azure Queue = 20,000
+
+
+After starting:
+
+systemctl start azure-gcs-rollback.service
+
+
+Queue dropped:
+
+20,000
+↓
+17,057
+↓
+6,912
+↓
+0
+
+What this proves
+
+Your rollback listener:
+
+rollback_listener.py
+
+
+was the component consuming messages from:
+
+blob-sync-events
+
+
+The logs showed continuous polling:
+
+GET https://hirteststoragemigration.queue.core.windows.net/blob-sync-events/messages
+Response status: 200
+
+
+and the queue count steadily decreased until:
+
+0
+
+Database confirms everything is processed
+SELECT status, COUNT(*)
+FROM sync_batches
+GROUP BY status;
+
+
+Result:
+
+COMPLETED = 45
+
+
+and
+
+SELECT status, COUNT(*)
+FROM file_events
+GROUP BY status;
+
+
+Result:
+
+COMPLETED = 789274
+FAILED    = 8
+
+
+Meaning:
+
+Pending Files      = 0
+Processing Files   = 0
+Batched Files      = 0
+Queue Messages     = 0
+
+Why did this happen?
+
+Most likely one of these:
+
+The rollback listener was stopped earlier, allowing messages to accumulate.
+The rollback listener is the actual consumer responsible for deleting queue messages.
+Messages were already processed in PostgreSQL but not deleted from Azure Queue until the listener started again.
+Current Health Check
+
+✅ Queue backlog cleared
+
+✅ Sync batches completed
+
+✅ File events completed
+
+✅ Autoscaler scaled down correctly
+
+✅ No running workers needed
+
+✅ No pending migration workload
+
+Final verification
+
+Run once:
+
+SELECT status, COUNT(*)
+FROM file_events
+GROUP BY status;
+
+
+Expected:
+
+COMPLETED ≈ 789274
+FAILED    = 8
+
+
+And:
+
+docker ps
+
+
+Expected:
+
+(no containers)
+
+
+And:
+
+python -c "
+import os
+from azure.storage.queue import QueueClient
+q = QueueClient.from_connection_string(
+    os.environ['AZURE_QUEUE_CONN_STR'],
+    os.environ['AZURE_QUEUE_NAME']
+)
+print(q.get_queue_properties().approximate_message_count)
+"
+
+
+Expected:
+
+0
+
+
+At this point, your forward migration pipeline appears fully drained and completed successfully. 🚀
+
+
+Perfect. This actually confirms your system is now behaving correctly.
+
+Timeline
+
+Initially:
+
+Azure Queue = 20,000
+
+
+After starting:
+
+systemctl start azure-gcs-rollback.service
+
+
+Queue dropped:
+
+20,000
+↓
+17,057
+↓
+6,912
+↓
+0
+
+What this proves
+
+Your rollback listener:
+
+rollback_listener.py
+
+
+was the component consuming messages from:
+
+blob-sync-events
+
+
+The logs showed continuous polling:
+
+GET https://hirteststoragemigration.queue.core.windows.net/blob-sync-events/messages
+Response status: 200
+
+
+and the queue count steadily decreased until:
+
+0
+
+Database confirms everything is processed
+SELECT status, COUNT(*)
+FROM sync_batches
+GROUP BY status;
+
+
+Result:
+
+COMPLETED = 45
+
+
+and
+
+SELECT status, COUNT(*)
+FROM file_events
+GROUP BY status;
+
+
+Result:
+
+COMPLETED = 789274
+FAILED    = 8
+
+
+Meaning:
+
+Pending Files      = 0
+Processing Files   = 0
+Batched Files      = 0
+Queue Messages     = 0
+
+Why did this happen?
+
+Most likely one of these:
+
+The rollback listener was stopped earlier, allowing messages to accumulate.
+The rollback listener is the actual consumer responsible for deleting queue messages.
+Messages were already processed in PostgreSQL but not deleted from Azure Queue until the listener started again.
+Current Health Check
+
+✅ Queue backlog cleared
+
+✅ Sync batches completed
+
+✅ File events completed
+
+✅ Autoscaler scaled down correctly
+
+✅ No running workers needed
+
+✅ No pending migration workload
+
+Final verification
+
+Run once:
+
+SELECT status, COUNT(*)
+FROM file_events
+GROUP BY status;
+
+
+Expected:
+
+COMPLETED ≈ 789274
+FAILED    = 8
+
+
+And:
+
+docker ps
+
+
+Expected:
+
+(no containers)
+
+
+And:
+
+python -c "
+import os
+from azure.storage.queue import QueueClient
+q = QueueClient.from_connection_string(
+    os.environ['AZURE_QUEUE_CONN_STR'],
+    os.environ['AZURE_QUEUE_NAME']
+)
+print(q.get_queue_properties().approximate_message_count)
+"
+
+
+Expected:
+
+0
+
+
+At this point, your forward migration pipeline appears fully drained and completed successfully. 🚀
